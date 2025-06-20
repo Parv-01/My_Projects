@@ -8,4 +8,4 @@ Some simple git commands :-\
 3.) ***git commit -m "message"/ left blank*** then can write longer commit messages\
 4.) ***git push origin main*** :-  push the local repo changes to main repo in github\
 Command to use git and change using local repo and integrate with github ;-\
-***git remote set-url origin https://<token>@github.com/<username>/<repo>***\
+***git remote set-url origin https://[token]@github.com/[username]/[repo]***\
