@@ -1,12 +1,16 @@
 // Includes
-#include <ctype.h> // For iscntrl function
-#include <errno.h> // For error handling
+#define _DEFAULT_SOURCE
+#define _BSED_SOURCE
+#define _GNU_SOURCE // These 3 maros are specifically defined for getline() ,may or maynot be used but good habbit to add them here
+#include <ctype.h>  // For iscntrl function
+#include <errno.h>  // For error handling
 #include <stdio.h>
 #include <stdlib.h>    // For exit function
 #include <sys/ioctl.h> // For terminal control IOCTL->ip/op ctrl to get window size
 #include <termios.h>   // For terminal control
 #include <unistd.h>
-#include <string.h> // For string manipulation functions
+#include <string.h>    // For string manipulation functions
+#include <sys/types.h> //For memory functions
 
 // Defines
 #define delulu_VERSION "0.0.1"   // Version of the text editor
@@ -21,10 +25,17 @@ enum editor_key
     DEL_KEY,           // Delete key <esc>[3~ in VT100
     HOME_KEY,          // Home key <esc>[1~ ,[7~,[H,OH in VT100>
     END_KEY,           // End key <esc>[4~ ,[8~,[F,OF in VT100>
-    PAGE_UP,          // Page up key <esc>[5~ in VT100>
-    PAGE_DOWN,        // Page down key <esc>[6~ in VT100>
+    PAGE_UP,           // Page up key <esc>[5~ in VT100>
+    PAGE_DOWN,         // Page down key <esc>[6~ in VT100>
 };
 // data
+
+typedef struct erow
+{
+    int size;
+    char *chars;
+} erow;
+
 //  struct termios original_termios; // To store original terminal attributes
 struct editor_config
 {
@@ -33,7 +44,10 @@ struct editor_config
     int screenrows;                  // Number of rows in the terminal
     int screencols;                  // Number of columns in the terminal
     struct termios original_termios; // To store original terminal attributes
-} E;                                 // Global variable to hold editor configuration
+    int numrows;
+    erow row;
+    struct termios orig_termios;
+} E; // Global variable to hold editor configuration
 
 // terminal functions
 void die(const char *s)
@@ -121,7 +135,7 @@ int key_read_editor()
         }
         if (seq[0] == '[')
         {
-            if(seq[1] >= '0' && seq[1] <= '9') // If the second character is a digit
+            if (seq[1] >= '0' && seq[1] <= '9') // If the second character is a digit
             {
                 if (read(STDIN_FILENO, &seq[2], 1) != 1) // Read the next character
                 {
@@ -134,48 +148,51 @@ int key_read_editor()
                     case '1':
                         return HOME_KEY; // Home key
                     case '3':
-                        return DEL_KEY;  // Delete key
+                        return DEL_KEY; // Delete key
                     case '4':
-                        return END_KEY;   // End key
+                        return END_KEY; // End key
                     case '5':
-                        return PAGE_UP;   // Page up key
+                        return PAGE_UP; // Page up key
                     case '6':
                         return PAGE_DOWN; // Page down key
                     case '7':
-                        return HOME_KEY;   // Home key
-                    case '8':
-                        return END_KEY;    // End key
-                    }
-                }
-            }else{
-                switch (seq[1]) // Check the second character of the escape sequence
-                {
-                    case 'A':
-                        return ARROW_UP; // Up arrow key
-                    case 'B':
-                        return ARROW_DOWN; // Down arrow key
-                    case 'C':
-                        return ARROW_RIGHT; // Right arrow key
-                    case 'D':
-                        return ARROW_LEFT; // Left arrow key
-                    case 'H':
                         return HOME_KEY; // Home key
-                    case 'F':
+                    case '8':
                         return END_KEY; // End key
                     }
                 }
-        }else if(seq[0] == 'O') // If the first character is 'O'
+            }
+            else
+            {
+                switch (seq[1]) // Check the second character of the escape sequence
+                {
+                case 'A':
+                    return ARROW_UP; // Up arrow key
+                case 'B':
+                    return ARROW_DOWN; // Down arrow key
+                case 'C':
+                    return ARROW_RIGHT; // Right arrow key
+                case 'D':
+                    return ARROW_LEFT; // Left arrow key
+                case 'H':
+                    return HOME_KEY; // Home key
+                case 'F':
+                    return END_KEY; // End key
+                }
+            }
+        }
+        else if (seq[0] == 'O') // If the first character is 'O'
         {
             switch (seq[1]) // Check the second character of the escape sequence
             {
-                case 'H':
+            case 'H':
                 return HOME_KEY; // Home key
-                case 'F':
+            case 'F':
                 return END_KEY; // End key
             }
         }
         // If the escape sequence is not recognized, return the escape character
-        return '\x1b'; 
+        return '\x1b';
     }
     else
     {
@@ -248,6 +265,37 @@ int get_window_size(int *rows, int *cols)
     return 0;
 }
 
+/*File i/o */
+void editor_open(char *filename)
+{ // Will open and read file from disk
+
+    FILE *fp = fopen(filename, "r");
+    if (!fp)
+    {
+        die("fp");
+    }
+    // char *line="Hello to Delulu";
+    // ssize_t linelen=15;
+    char *line = NULL;
+    ssize_t linecap = 0;
+    ssize_t linelen;
+    linelen = getline(&line, &linecap, fp);
+    if (linelen != -1)
+    {
+        while (linelen > 0 && (line[linelen - 1] == '\n') || (line[linelen - 1] == '\r'))
+        {
+            linelen--;
+        }
+        E.row.size = linelen;
+        E.row.chars = malloc(linelen + 1);
+        memcpy(E.row.chars, line, linelen);
+        E.row.chars[linelen] = '\0';
+        E.numrows = 1;
+    }
+    free(line);
+    fclose(fp);
+}
+
 /*Append Buffer*/
 // This section is for handling the append buffer, which is used to efficiently build strings for output
 struct abuf
@@ -283,34 +331,47 @@ void editor_draw_rows(struct abuf *ab)
     int y;
     for (y = 0; y < E.screenrows; y++)
     {
-        if (y == E.screenrows / 3)
+        if (y >= E.numrows)
         {
-            char *welcome = "Delulu Text Editor - Version " delulu_VERSION;
-            int welcomelen = strlen(welcome); // Get the length of the welcome message
-            if (welcomelen > E.screencols)
+            if (E.numrows == 0 && y == E.screenrows / 3)
             {
-                welcomelen = E.screencols; // Limit the length to the number of columns
+                char welcome[80];
+                int welcome_note = snprintf(welcome, sizeof(welcome), "Delulu Editor - Version %s", delulu_VERSION);
+                int welcomelen = strlen(welcome); // Get the length of the welcome message
+                if (welcomelen > E.screencols)
+                {
+                    welcomelen = E.screencols; // Limit the length to the number of columns
+                }
+                int padding = (E.screencols - welcomelen) / 2; // Calculate padding for centering
+                if (padding)
+                {
+                    ab_append(ab, "~", 1); // Draw the first row with a tilde
+                    // 1 byte long ~ -> tilde char
+                    padding--; // Decrease padding after adding tilde
+                }
+                while (padding--)
+                {
+                    ab_append(ab, " ", 1); // Add spaces for padding
+                    // 1 byte long space -> space char
+                }
+                ab_append(ab, welcome, welcomelen); // Append the welcome message to the buffer
+                // 11 bytes long delulu_VERSION -> version of the text editor
             }
-            int padding = (E.screencols - welcomelen) / 2; // Calculate padding for centering
-            if (padding)
+            else
             {
                 ab_append(ab, "~", 1); // Draw the first row with a tilde
-                // 1 byte long ~ -> tilde char
-                padding--; // Decrease padding after adding tilde
+                // 3 bytes long >\r\n -> ~ char,carriage return and newline
+                // \r is carriage return (ASCII 13) and \n is newline (ASCII
             }
-            while (padding--)
-            {
-                ab_append(ab, " ", 1); // Add spaces for padding
-                // 1 byte long space -> space char
-            }
-            ab_append(ab, welcome, welcomelen); // Append the welcome message to the buffer
-            // 11 bytes long delulu_VERSION -> version of the text editor
         }
         else
         {
-            ab_append(ab, "~", 1); // Draw the first row with a tilde
-            // 3 bytes long >\r\n -> ~ char,carriage return and newline
-            // \r is carriage return (ASCII 13) and \n is newline (ASCII
+            int len = E.row.size;
+            if (len > E.screencols)
+            {
+                len = E.screencols;
+            }
+            ab_append(ab, E.row.chars, len);
         }
         ab_append(ab, "\x1b[K", 3); // Clear the line
         // 3 bytes long \x1b[K -> escape sequence to clear the line
@@ -368,26 +429,30 @@ void editor_move_cursor(int key)
     switch (key) // This function moves the cursor based on the key pressed
     {
     case ARROW_LEFT:
-        if(E.cx!=0){
-        E.cx--; // Move cursor left
+        if (E.cx != 0)
+        {
+            E.cx--; // Move cursor left
         }
         break;
     case ARROW_RIGHT:
-        if(E.cx < E.screencols - 1){
-        // E.cx < E.screencols - 1 to prevent cursor from moving beyond
-        E.cx++; // Move cursor right
+        if (E.cx < E.screencols - 1)
+        {
+            // E.cx < E.screencols - 1 to prevent cursor from moving beyond
+            E.cx++; // Move cursor right
         }
         break;
     case ARROW_UP:
-        if(E.cy!=0){
-        // E.cy!=0 to prevent cursor from moving beyond the top of the screen
-        E.cy--; // Move cursor up
-        }   
+        if (E.cy != 0)
+        {
+            // E.cy!=0 to prevent cursor from moving beyond the top of the screen
+            E.cy--; // Move cursor up
+        }
         break;
     case ARROW_DOWN:
-        if(E.cy < E.screenrows - 1){
-        // E.cy < E.screenrows - 1 to prevent cursor from moving beyond the bottom
-        E.cy++; // Move cursor down
+        if (E.cy < E.screenrows - 1)
+        {
+            // E.cy < E.screenrows - 1 to prevent cursor from moving beyond the bottom
+            E.cy++; // Move cursor down
         }
         break;
     }
@@ -404,19 +469,20 @@ void editor_process_keypress()
         exit(0);                            // Exit the program
         break;
     case HOME_KEY: // If Home key is pressed
-        E.cx = 0; // Move cursor to the beginning of the line
+        E.cx = 0;  // Move cursor to the beginning of the line
         break;
-    case END_KEY: // If End key is pressed
+    case END_KEY:                // If End key is pressed
         E.cx = E.screencols - 1; // Move cursor to the end
         break;
     case PAGE_UP:
     case PAGE_DOWN:
+    {
+        int times = E.screenrows; // Number of rows to move the cursor
+        while (times--)
         {
-            int times = E.screenrows; // Number of rows to move the cursor
-            while(times--){
-                editor_move_cursor(c==PAGE_UP ? ARROW_UP : ARROW_DOWN); // Move the cursor up or down based on the key pressed
-            }
+            editor_move_cursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN); // Move the cursor up or down based on the key pressed
         }
+    }
     case ARROW_UP:
     case ARROW_DOWN:
     case ARROW_LEFT:
@@ -430,8 +496,9 @@ void editor_process_keypress()
 void editor_init()
 {
     // This function initializes the editor configuration
-    E.cx = 0; // Initialize cursor x position
-    E.cy = 0; // Initialize cursor y position
+    E.cx = 0;      // Initialize cursor x position
+    E.cy = 0;      // Initialize cursor y position
+    E.numrows = 0; // Initialize num of rows
     // Initialize the editor configuration
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
     {
@@ -439,11 +506,14 @@ void editor_init()
     }
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     set_terminal_raw_mode(); // Set terminal to raw mode
     editor_init();           // Its job is to initialize the editor configuration, including getting the terminal size
-
+    if (argc >= 2)
+    {
+        editor_open(argv[1]);
+    }
     // Read characters from standard input until 'p' is pressed
     // char c;
     // while(read(STDIN_FILENO,&c,1)==1 && (c!='p')){ //read file until p is not triggered
@@ -493,5 +563,3 @@ int main()
 
 // The editor_process_keypress waits for keypress & then handles it,later it'll map various Ctrl combinations & other special keys to diff editor funct,& insert any alphanumeric characters and other printable keys char into text thats being edited
 // editor_process_keypress belongs in /*terminal */ section bcoz it deals with low-level terminal ip,whereas editor_process_keypress is more about handling user input and processing key presses in the context of an editor. The separation allows for better organization of code, making it easier to maintain and extend functionality in the future.
-
-// Last step done is step 54
