@@ -41,13 +41,17 @@ struct editor_config
 {
     // This struct holds the editor configuration
     int cx, cy;                      // Cursor position (x, y)
+    int rowoff;                  // Row offset for scrolling
+    int coloff;                  // Column offset for scrolling
     int screenrows;                  // Number of rows in the terminal
     int screencols;                  // Number of columns in the terminal
     struct termios original_termios; // To store original terminal attributes
     int numrows;
-    erow row;
+    // erow row;
+    //To store multiple lines we make erow array of erow structs 
+    erow *row; // Array of rows in the editor
     struct termios orig_termios;
-} E; // Global variable to hold editor configuration
+}E; // Global variable to hold editor configuration
 
 // terminal functions
 void die(const char *s)
@@ -265,6 +269,19 @@ int get_window_size(int *rows, int *cols)
     return 0;
 }
 
+/* row operations*/
+void editor_AppendRows(char *s,size_t len){
+    E.row=realloc(E.row,sizeof(erow)*(E.numrows+1)); // Reallocate memory for the rows array
+    int at = E.numrows; // Get the current number of rows
+    E.row[at].size = len; // Set the size of the new row
+    E.row[at].chars = malloc(len + 1); // Allocate memory for the
+    // characters in the new row
+    memcpy(E.row[at].chars, s, len); // Copy the characters from the
+    E.row[at].chars[len] = '\0'; // Null-terminate the string
+    E.numrows++; // Increment the number of rows
+
+}
+
 /*File i/o */
 void editor_open(char *filename)
 { // Will open and read file from disk
@@ -272,25 +289,27 @@ void editor_open(char *filename)
     FILE *fp = fopen(filename, "r");
     if (!fp)
     {
-        die("fp");
+        die("fopen");
     }
     // char *line="Hello to Delulu";
     // ssize_t linelen=15;
     char *line = NULL;
     ssize_t linecap = 0;
     ssize_t linelen;
-    linelen = getline(&line, &linecap, fp);
-    if (linelen != -1)
-    {
-        while (linelen > 0 && (line[linelen - 1] == '\n') || (line[linelen - 1] == '\r'))
-        {
-            linelen--;
+    // linelen = getline(&line, &linecap, fp);
+    // if (linelen != -1)
+    // {
+    //     while (linelen > 0 && (line[linelen - 1] == '\n') || (line[linelen - 1] == '\r'))
+    //     {
+    //         linelen--;
+    //     }
+    //     editor_AppendRows(line,linelen); // Append the line to the editor rows
+    // }
+    while((linelen=getline(&line,&linecap,fp))!=-1){
+        while(linelen>0 && (line[linelen-1]=='\n' || line[linelen-1]=='\r')){
+            linelen--; // Remove trailing newline or carriage return
         }
-        E.row.size = linelen;
-        E.row.chars = malloc(linelen + 1);
-        memcpy(E.row.chars, line, linelen);
-        E.row.chars[linelen] = '\0';
-        E.numrows = 1;
+        editor_AppendRows(line,linelen); // Append the line to the editor rows
     }
     free(line);
     fclose(fp);
@@ -325,13 +344,30 @@ void ab_free(struct abuf *ab)
 }
 
 // output functions
+void editor_scroll(){
+    if(E.cy < E.rowoff) {
+        E.rowoff = E.cy; // If the cursor is above the visible area, adjust the row offset
+    }
+    if(E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1; // If the cursor is below the visible area, adjust the row offset
+    }
+    if(E.cx<E.coloff){
+        E.coloff=E.cx;
+    }
+    if(E.cx>=E.coloff + E.screencols){
+        E.coloff = E.cx - E.screencols +1;
+    }
+}
+
+// This function draws the rows of the editor to the append buffer
 void editor_draw_rows(struct abuf *ab)
 {
     // This function would draw the rows of the editor
     int y;
     for (y = 0; y < E.screenrows; y++)
     {
-        if (y >= E.numrows)
+        int filerow = y + E.rowoff; // Calculate the row to be drawn based on the offset
+        if (filerow >= E.numrows)
         {
             if (E.numrows == 0 && y == E.screenrows / 3)
             {
@@ -366,12 +402,16 @@ void editor_draw_rows(struct abuf *ab)
         }
         else
         {
-            int len = E.row.size;
+            int len = E.row[filerow].size - E.coloff; // Get the length of the row
+            if(len < 0)
+            {
+                len = 0; // If the length is negative, set it to 0
+            }
             if (len > E.screencols)
             {
                 len = E.screencols;
             }
-            ab_append(ab, E.row.chars, len);
+            ab_append(ab,&E.row[filerow].chars[E.coloff], len);
         }
         ab_append(ab, "\x1b[K", 3); // Clear the line
         // 3 bytes long \x1b[K -> escape sequence to clear the line
@@ -386,6 +426,7 @@ void editor_draw_rows(struct abuf *ab)
 
 void editor_refressh_screen()
 {
+    editor_scroll(); // Scroll the editor if necessary
     struct abuf ab = ABUF_INIT;     // Initialize the append buffer
     ab_append(&ab, "\x1b[?25l", 6); // Hide the cursor
     // 6 bytes long \x1b[?25l -> escape sequence to hide the cursor
@@ -404,7 +445,7 @@ void editor_refressh_screen()
     // rows,col no starts from 1 not 0,so <esc>[H is same as <esc>[1;1H
     editor_draw_rows(&ab); // Draw the rows of the editor
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.cx - E.coloff) + 1);
     // 32 bytes long buf -> buffer to hold the cursor position escape sequence
     // snprintf is used to format the string with cursor position
     // E.cy and E.cx are the current cursor position in the editor
@@ -426,6 +467,7 @@ void editor_refressh_screen()
 // input functions
 void editor_move_cursor(int key)
 {
+    erow *row =(E.cy>=E.numrows) ? NULL :&E.row[E.cy];
     switch (key) // This function moves the cursor based on the key pressed
     {
     case ARROW_LEFT:
@@ -435,11 +477,13 @@ void editor_move_cursor(int key)
         }
         break;
     case ARROW_RIGHT:
-        if (E.cx < E.screencols - 1)
-        {
-            // E.cx < E.screencols - 1 to prevent cursor from moving beyond
-            E.cx++; // Move cursor right
-        }
+        // if (E.cx < E.screencols - 1)
+        // {
+        //     // E.cx < E.screencols - 1 to prevent cursor from moving beyond
+        //     E.cx++; // Move cursor right
+        // }
+        if(row && E.x <row->size){
+        E.cx++;}
         break;
     case ARROW_UP:
         if (E.cy != 0)
@@ -449,12 +493,17 @@ void editor_move_cursor(int key)
         }
         break;
     case ARROW_DOWN:
-        if (E.cy < E.screenrows - 1)
+        if (E.cy < E.numrows)
         {
             // E.cy < E.screenrows - 1 to prevent cursor from moving beyond the bottom
             E.cy++; // Move cursor down
         }
         break;
+    }
+    row=(E.cy>=E.numrows) ?NULL:&E.row[E.cy];
+    int rowlen=row?row->size:0;
+    if(E.cx>rowlen){
+        E.cx=rowlen;
     }
 }
 
@@ -498,7 +547,10 @@ void editor_init()
     // This function initializes the editor configuration
     E.cx = 0;      // Initialize cursor x position
     E.cy = 0;      // Initialize cursor y position
+    E.rowoff = 0;  // Initialize row offset for scrolling
+    E.coloff = 0;  // Initialize column offset for scrolling
     E.numrows = 0; // Initialize num of rows
+    E.row=NULL;  //Initialise rows to NULL
     // Initialize the editor configuration
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
     {
@@ -563,3 +615,4 @@ int main(int argc, char *argv[])
 
 // The editor_process_keypress waits for keypress & then handles it,later it'll map various Ctrl combinations & other special keys to diff editor funct,& insert any alphanumeric characters and other printable keys char into text thats being edited
 // editor_process_keypress belongs in /*terminal */ section bcoz it deals with low-level terminal ip,whereas editor_process_keypress is more about handling user input and processing key presses in the context of an editor. The separation allows for better organization of code, making it easier to maintain and extend functionality in the future.
+//last step done is 77
