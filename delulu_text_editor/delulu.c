@@ -6,15 +6,19 @@
 #include <errno.h>  // For error handling
 #include <stdio.h>
 #include <stdlib.h>    // For exit function
+#include <stdarg.h>
 #include <sys/ioctl.h> // For terminal control IOCTL->ip/op ctrl to get window size
 #include <termios.h>   // For terminal control
 #include <unistd.h>
 #include <string.h>    // For string manipulation functions
 #include <sys/types.h> //For memory functions
+#include <time.h>
 
 // Defines
 #define delulu_VERSION "0.0.1"   // Version of the text editor
+#define KILO_TAB_STOP 8
 #define CTRL_KEY(k) ((k) & 0x1f) // Macro to convert a control key to its ASCII value
+
 enum editor_key
 {
     // This enum defines the keys used in the editor
@@ -32,8 +36,8 @@ enum editor_key
 
 typedef struct erow
 {
-    int size;
-    char *chars;
+    int size,rsize;
+    char *chars,*render;
 } erow;
 
 //  struct termios original_termios; // To store original terminal attributes
@@ -41,8 +45,9 @@ struct editor_config
 {
     // This struct holds the editor configuration
     int cx, cy;                      // Cursor position (x, y)
-    int rowoff;                  // Row offset for scrolling
-    int coloff;                  // Column offset for scrolling
+    int rx;
+    int rowoff;                     // Row offset for scrolling
+    int coloff;                     // Column offset for scrolling
     int screenrows;                  // Number of rows in the terminal
     int screencols;                  // Number of columns in the terminal
     struct termios original_termios; // To store original terminal attributes
@@ -50,6 +55,9 @@ struct editor_config
     // erow row;
     //To store multiple lines we make erow array of erow structs 
     erow *row; // Array of rows in the editor
+    char *filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
     struct termios orig_termios;
 }E; // Global variable to hold editor configuration
 
@@ -270,6 +278,42 @@ int get_window_size(int *rows, int *cols)
 }
 
 /* row operations*/
+int editor_rowcxtorx(erow *row,int cx){
+    int rx=0,j;
+    for(j=0;j<cx;j++){
+        if(row->chars[j]=='\t'){
+            rx +=(KILO_TAB_STOP-1)-(rx%KILO_TAB_STOP);
+        }
+        rx++;
+    }
+    return rx;
+}
+
+void editor_UpdateRows(erow *row){
+    int tabs=0;
+    int j;
+    for(j=0;j<row->size;j++){
+        if(row->chars[j]=='\t'){
+            tabs++;
+        }
+    }
+    free(row->render);
+    row->render=malloc(row->size+tabs*(KILO_TAB_STOP-1)+1);
+    int idx=0;
+    for(j=0;j<row->size;j++){
+        if(row->chars[j]=='\t'){
+            row->render[idx++]=' ';
+            while(idx % KILO_TAB_STOP !=0){
+                row->render[idx++]=' ';
+            }
+        }else{
+            row->render[idx++]=row->chars[j];
+        }
+    }
+    row->render[idx]='\0';
+    row->rsize=idx;
+}
+
 void editor_AppendRows(char *s,size_t len){
     E.row=realloc(E.row,sizeof(erow)*(E.numrows+1)); // Reallocate memory for the rows array
     int at = E.numrows; // Get the current number of rows
@@ -278,6 +322,9 @@ void editor_AppendRows(char *s,size_t len){
     // characters in the new row
     memcpy(E.row[at].chars, s, len); // Copy the characters from the
     E.row[at].chars[len] = '\0'; // Null-terminate the string
+    E.row[at].rsize=0;//Contains size of contents of render string
+    E.row[at].render=NULL;
+    editor_UpdateRows(&E.row[at]);
     E.numrows++; // Increment the number of rows
 
 }
@@ -285,7 +332,8 @@ void editor_AppendRows(char *s,size_t len){
 /*File i/o */
 void editor_open(char *filename)
 { // Will open and read file from disk
-
+    free(E.filename);
+    E.filename=strdup(filename);
     FILE *fp = fopen(filename, "r");
     if (!fp)
     {
@@ -336,6 +384,7 @@ void ab_append(struct abuf *ab, const char *s, int len)
     ab->b = new;                   // Update the buffer pointer
     ab->len += len;                // Update the length of the buffer
 }
+
 void ab_free(struct abuf *ab)
 {
     free(ab->b);  // Free the memory allocated for the buffer
@@ -345,17 +394,21 @@ void ab_free(struct abuf *ab)
 
 // output functions
 void editor_scroll(){
+    E.rx=0;
+    if(E.cy<E.numrows){
+        E.rx=editor_rowcxtorx(&E.row[E.cy],E.cx);
+    }
     if(E.cy < E.rowoff) {
         E.rowoff = E.cy; // If the cursor is above the visible area, adjust the row offset
     }
     if(E.cy >= E.rowoff + E.screenrows) {
         E.rowoff = E.cy - E.screenrows + 1; // If the cursor is below the visible area, adjust the row offset
     }
-    if(E.cx<E.coloff){
-        E.coloff=E.cx;
+    if(E.rx<E.coloff){
+        E.coloff=E.rx;
     }
-    if(E.cx>=E.coloff + E.screencols){
-        E.coloff = E.cx - E.screencols +1;
+    if(E.rx>=E.coloff + E.screencols){
+        E.coloff = E.rx - E.screencols +1;
     }
 }
 
@@ -402,7 +455,7 @@ void editor_draw_rows(struct abuf *ab)
         }
         else
         {
-            int len = E.row[filerow].size - E.coloff; // Get the length of the row
+            int len = E.row[filerow].rsize - E.coloff; // Get the length of the row
             if(len < 0)
             {
                 len = 0; // If the length is negative, set it to 0
@@ -411,16 +464,47 @@ void editor_draw_rows(struct abuf *ab)
             {
                 len = E.screencols;
             }
-            ab_append(ab,&E.row[filerow].chars[E.coloff], len);
+            ab_append(ab,&E.row[filerow].render[E.coloff], len);
         }
         ab_append(ab, "\x1b[K", 3); // Clear the line
         // 3 bytes long \x1b[K -> escape sequence to clear the line
         // for the last line in text editor, we don't want to print a >
-        if (y < E.screenrows - 1)
-        {
-            ab_append(ab, "\r\n", 2); // Move to the next line
+        // if (y < E.screenrows - 1)
+        // {
+        ab_append(ab, "\r\n", 2); // Move to the next line
             // 2 bytes long \r\n -> carriage return and newline
-        }
+        //}
+    }
+}
+
+void editor_draw_StatusBar(struct abuf *ab){
+ab_append(ab,"\x1b[7m]",4);
+char status[80],rstatus[80];
+int len=snprintf(status,sizeof(status),"%.20s - %d lines",E.filename ? E.filename :"[No Name]",E.numrows);
+int rlen=snprintf(rstatus,sizeof(rstatus),"%d/%d",E.cy+1,E.numrows);
+if(len>E.screencols) len = E.screencols;
+ab_append(ab,status,len);
+while(len<E.screencols){
+    if(E.screencols-len == rlen){
+        ab_append(ab,rstatus,rlen);
+        break;
+    }else{
+        ab_append(ab," ",1);
+        len++;
+    }
+}
+ab_append(ab,"x1b[m",3);
+ab_append(ab,"\r\n",2);
+}
+
+void editor_draw_MessageBar(struct abuf *ab){
+    ab_append(ab,"\x1b[K",3);
+    int msglen=strlen(E.statusmsg);
+    if(msglen>E.screencols){
+        msglen=E.screencols;
+    }
+    if(msglen&&time(NULL)-E.statusmsg_time<5){
+        ab_append(ab,E.statusmsg,msglen);
     }
 }
 
@@ -444,26 +528,34 @@ void editor_refressh_screen()
     // default is 1,1 which is top-left corner of screen
     // rows,col no starts from 1 not 0,so <esc>[H is same as <esc>[1;1H
     editor_draw_rows(&ab); // Draw the rows of the editor
+    editor_draw_StatusBar(&ab);
+    editor_draw_MessageBar(&ab);
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.cx - E.coloff) + 1);
+    snprintf(buf,sizeof(buf),"\x1b[%d;%dH",(E.cy-E.rowoff)+1,(E.rx - E.coloff)+1);
     // 32 bytes long buf -> buffer to hold the cursor position escape sequence
     // snprintf is used to format the string with cursor position
     // E.cy and E.cx are the current cursor position in the editor
     // E.cy is the row number and E.cx is the column number
     // We add 1 to both E.cy and E.cx because the escape sequence uses 1-based indexing
     // 1 byte \x1b -> escape char,2 bytes [d;dH -> row no and col no at which cursor should be placed
-    ab_append(&ab, buf, strlen(buf)); // Append the cursor position escape sequence to the buffer
+    ab_append(&ab,buf,strlen(buf)); // Append the cursor position escape sequence to the buffer
     // strlen(buf) returns the length of the formatted string in buf
     // 1 byte \x1b -> escape char,2 bytes [d;dH -> row no and col no at which cursor should be placed
     // write(STDOUT_FILENO, ab.b, ab.len); // Write the buffer to standard output
     // 1 byte \x1b -> escape char,2 bytes [d;dH -> row no and col no at which cursor should be placed
     // ab.b is the pointer to the buffer and ab.len is the length of the buffer
-
-    ab_append(&ab, "\x1b[?25l", 6);
-    write(STDOUT_FILENO, ab.b, ab.len); // Move cursor back to the home position (top-left corner)
+    ab_append(&ab,"\x1b[?25l",6);
+    write(STDOUT_FILENO,ab.b,ab.len); // Move cursor back to the home position (top-left corner)
     ab_free(&ab);                       // Free the append buffer memory
 }
 
+void editor_setstatus_Message(const char*fmt,...){
+    va_list ap;
+    va_start(ap,fmt);
+    vsnprintf(E.statusmsg,sizeof(E.statusmsg),fmt,ap);
+    va_end(ap);
+    E.statusmsg_time=time(NULL);
+}
 // input functions
 void editor_move_cursor(int key)
 {
@@ -474,6 +566,9 @@ void editor_move_cursor(int key)
         if (E.cx != 0)
         {
             E.cx--; // Move cursor left
+        }else if(E.cy>0){
+            E.cy--;
+            E.cx=E.row[E.cy].size;//Allowing user to press <- at begining of line to move to end of previous line
         }
         break;
     case ARROW_RIGHT:
@@ -482,8 +577,11 @@ void editor_move_cursor(int key)
         //     // E.cx < E.screencols - 1 to prevent cursor from moving beyond
         //     E.cx++; // Move cursor right
         // }
-        if(row && E.x <row->size){
-        E.cx++;}
+        if(row && E.cx <row->size){
+        E.cx++;}else if(row&&E.cx==row->size){
+            E.cy++;
+            E.cx=0; //Allowing user to to press -> at end of line 
+        }
         break;
     case ARROW_UP:
         if (E.cy != 0)
@@ -521,11 +619,21 @@ void editor_process_keypress()
         E.cx = 0;  // Move cursor to the beginning of the line
         break;
     case END_KEY:                // If End key is pressed
-        E.cx = E.screencols - 1; // Move cursor to the end
+        if(E.cy<E.numrows){
+            E.cx = E.row[E.cy].size; // Move cursor to the end
+        }
         break;
     case PAGE_UP:
     case PAGE_DOWN:
     {
+        if(c==PAGE_UP){
+            E.cy=E.rowoff;
+        }else if(c==PAGE_DOWN){
+            E.cy=E.rowoff+E.screenrows-1;
+            if(E.cy>E.numrows){
+                E.cy=E.numrows;
+            }
+        }
         int times = E.screenrows; // Number of rows to move the cursor
         while (times--)
         {
@@ -540,22 +648,27 @@ void editor_process_keypress()
         break;
     }
 }
-// init
 
+// init
 void editor_init()
 {
     // This function initializes the editor configuration
     E.cx = 0;      // Initialize cursor x position
     E.cy = 0;      // Initialize cursor y position
+    E.rx=0;
     E.rowoff = 0;  // Initialize row offset for scrolling
     E.coloff = 0;  // Initialize column offset for scrolling
     E.numrows = 0; // Initialize num of rows
     E.row=NULL;  //Initialise rows to NULL
+    E.filename=NULL;
+    E.statusmsg[0]='\0';
+    E.statusmsg_time=0;
     // Initialize the editor configuration
     if (get_window_size(&E.screenrows, &E.screencols) == -1)
     {
         die("get_window_size");
     }
+    E.screenrows -=2;
 }
 
 int main(int argc, char *argv[])
@@ -576,7 +689,7 @@ int main(int argc, char *argv[])
     //         printf("%d ('%c')\r\n",c, c); // Print regular character
     //     }
     // }
-
+    editor_setstatus_Message("HELP: Ctrl-Q=quit");
     while (1)
     {
         // char c='\0';
@@ -603,16 +716,15 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-// This program sets the terminal to raw mode, reads characters from standard input,
-// and prints their ASCII values. It handles control characters differently by printing their ASCII values.
-/*
- *tcsetattr(), read(),tcgetattr() are system calls used to control terminal behavior ;if return -1, it indicates an error occurred, and we handle it using the die() function which prints the error message and exits the program.
+/* This program sets the terminal to raw mode, reads characters from standard input,
+ and prints their ASCII values. It handles control characters differently by printing their ASCII values.
+ tcsetattr(), read(),tcgetattr() are system calls used to control terminal behavior ;if return -1, it indicates an error occurred, and we handle it using the die() function which prints the error message and exits the program.
+ CTRL_KEY macro bitwise-ANDs a char with val 00011111,in binary, which effectively converts a control key to its ASCII value. For example, CTRL_KEY('a') would yield 1 (0x01), CTRL_KEY('b') would yield 2 (0x02), and so on. 
+ This allows us to easily check for control key combinations in the input handling loop.Ctrl key in terminal strips 5 & 6 bits from whatever key is pressed and send that
+ key_read_editor job is to wait for 1 keypress and return it, later we expand func to handle escape seq,involving multiple bytes representing single keypresses like arrow keys, function keys, etc.
+ The editor_process_keypress waits for keypress & then handles it,later it'll map various Ctrl combinations & other special keys to diff editor funct,& insert any alphanumeric characters and other printable keys char into text thats being edited
+ editor_process_keypress belongs in {terminal} section bcoz it deals with low-level terminal ip,whereas editor_process_keypress is more about handling user input and processing key presses in the context of an editor.
+ The separation allows for better organization of code,making it easier to maintain and extend functionality in the future.
  */
 
-// CTRL_KEY macro bitwise-ANDs a char with val 00011111,in binary, which effectively converts a control key to its ASCII value. For example, CTRL_KEY('a') would yield 1 (0x01), CTRL_KEY('b') would yield 2 (0x02), and so on. This allows us to easily check for control key combinations in the input handling loop.
-// ctrl key in terminal strips 5 & 6 bits from whatever key is pressed and send that
-//  key_read_editor job is to wait for 1 keypress and return it, later we expand func to handle escape seq,involving multiple bytes representing single keypresses like arrow keys, function keys, etc.
-
-// The editor_process_keypress waits for keypress & then handles it,later it'll map various Ctrl combinations & other special keys to diff editor funct,& insert any alphanumeric characters and other printable keys char into text thats being edited
-// editor_process_keypress belongs in /*terminal */ section bcoz it deals with low-level terminal ip,whereas editor_process_keypress is more about handling user input and processing key presses in the context of an editor. The separation allows for better organization of code, making it easier to maintain and extend functionality in the future.
-//last step done is 77
+ //last step done is 100
