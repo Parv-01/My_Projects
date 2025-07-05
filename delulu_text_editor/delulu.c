@@ -4,6 +4,7 @@
 #define _GNU_SOURCE // These 3 maros are specifically defined for getline() ,may or maynot be used but good habbit to add them here
 #include <ctype.h>  // For iscntrl function
 #include <errno.h>  // For error handling
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>    // For exit function
 #include <stdarg.h>
@@ -16,12 +17,14 @@
 
 // Defines
 #define delulu_VERSION "0.0.1"   // Version of the text editor
-#define KILO_TAB_STOP 8
+#define DELULU_TAB_STOP 8
+#define DELULU_QUIT_TIMES 3
 #define CTRL_KEY(k) ((k) & 0x1f) // Macro to convert a control key to its ASCII value
 
 enum editor_key
 {
     // This enum defines the keys used in the editor
+    BACKSPACE=127;     //
     ARROW_LEFT = 1000, // Left arrow key
     ARROW_RIGHT,       // Right arrow key
     ARROW_UP,          // Up arrow key
@@ -55,11 +58,15 @@ struct editor_config
     // erow row;
     //To store multiple lines we make erow array of erow structs 
     erow *row; // Array of rows in the editor
+    int dirty;
     char *filename;
     char statusmsg[80];
     time_t statusmsg_time;
     struct termios orig_termios;
 }E; // Global variable to hold editor configuration
+
+/*prototypes*/
+void editor_setstatus_Message(const char *fmt,...);
 
 // terminal functions
 void die(const char *s)
@@ -282,7 +289,7 @@ int editor_rowcxtorx(erow *row,int cx){
     int rx=0,j;
     for(j=0;j<cx;j++){
         if(row->chars[j]=='\t'){
-            rx +=(KILO_TAB_STOP-1)-(rx%KILO_TAB_STOP);
+            rx +=(DELULU_TAB_STOP-1)-(rx%DELULU_TAB_STOP);
         }
         rx++;
     }
@@ -298,12 +305,12 @@ void editor_UpdateRows(erow *row){
         }
     }
     free(row->render);
-    row->render=malloc(row->size+tabs*(KILO_TAB_STOP-1)+1);
+    row->render=malloc(row->size+tabs*(DELULU_TAB_STOP-1)+1);
     int idx=0;
     for(j=0;j<row->size;j++){
         if(row->chars[j]=='\t'){
             row->render[idx++]=' ';
-            while(idx % KILO_TAB_STOP !=0){
+            while(idx % DELULU_TAB_STOP !=0){
                 row->render[idx++]=' ';
             }
         }else{
@@ -326,10 +333,94 @@ void editor_AppendRows(char *s,size_t len){
     E.row[at].render=NULL;
     editor_UpdateRows(&E.row[at]);
     E.numrows++; // Increment the number of rows
+    E.dirty++;
 
 }
 
+void editorFreerow(erow *row){
+    free(row->render);
+    free(row->chars);
+}
+
+void editor_RowinsertChar(erow *row,int at,int c){
+    if(at<0||at>row->size){
+        at=row->size;
+    }
+    row->chars=realloc(row->chars,row->size+2);
+    memmove(&row->chars[at+1],&row->chars[at],row->size-at+1); //comes from string same like mmcpy but safer 
+    row->size++;
+    row->chars[at]=c;
+    editor_UpdateRows(row);
+    E.dirty++;
+}
+
+void editor_rowdelchar(erow *row,int at){
+    if(at<0||at>=row->size){
+        return;
+    }
+    editorFreerow(&E.row[at]);
+    memmove(&row->chars[at],&row->chars[at+1],row->size-at);
+    row->size--;
+    editor_UpdateRows(row);
+    E.dirty++;
+}
+
+/*editor operations*/
+void editor_insertchar(int c){
+    if(E.cy==E.numrows){
+        editor_AppendRows("",0);
+    }
+    editor_RowinsertChar(&E.row[E.cy],E.cx,c);
+    E.cx++;
+}
+
+void editor_delchar(){
+    if(E.cy==E.numrows){
+        return;
+    }
+    if(E.cx==0&&E.cy==0){
+        return;
+    }
+    erow *row=&E.row[E.cy];
+    if(E.cx>0){
+        editor_rowdelchar(row,E.cx-1);
+        E.cx--;
+    }else{
+        E.cx=E.row[E.cy-1].size;
+        editorRowAppendString(&E.row[E.cy-1],row->chars,row->size);
+        editor_rowdelchar(E.cy);
+        E.cy--;
+    }
+}
+
+void editorRowAppendString(erow *row,char *s,size_t len){
+    row->chars=realloc(row->chars,row->size+len+1);
+    memcpy(&row->chars[row->size],s,len);
+    row->size+=len;
+    row->chars[row->size]='\0';
+    editor_UpdateRows(row);
+    E.dirty++;
+}
+
 /*File i/o */
+void *editor_rowtostring(int *buflen){
+    int totlen=0;
+    int j;
+    for(j=0;j<E.numrows;j++){
+        totlen+=E.row[j].size+1;
+    }
+    *buflen=totlen;
+    char *buf=malloc(totlen);
+    char *p=buf;
+    for(j=0;j<E.numrows;j++){
+        memcpy(p,E.row[j].chars,E.row[j].size);
+        p += E.row[j].size;
+        *p ='\n';
+        p++;
+    }
+    return buf;
+}
+
 void editor_open(char *filename)
 { // Will open and read file from disk
     free(E.filename);
@@ -361,6 +452,32 @@ void editor_open(char *filename)
     }
     free(line);
     fclose(fp);
+    E.dirty=0;
+}
+
+void editor_save(){
+    if(E.filename==NULL){
+        return;
+    }
+    int len;
+    char *buf=editor_rowtostring(&len);
+    int fd =open(E.filename,O_RDWR|O_CREAT,0644);
+    if(fd!=-1){
+        if(ftruncate(fd,len)!=-1){
+            if(write(fd,buf,len)==len){
+                close(fd);
+                free(buf);
+                E.ddirty=0;
+                editor_setstatus_Message("%d bytes written to disk",len);
+                return;
+            }
+        }close(fd);
+    }
+    free(buf);
+    editor_setstatus_Message("Can't save I/O error: %s",strerror(errno));
+    //O_RDWR -> for read and write
+    //O_CREAT -> extra arg to contain mode(the permission) the new file should have 
+    //0644 -> std permissions
 }
 
 /*Append Buffer*/
@@ -480,7 +597,7 @@ void editor_draw_rows(struct abuf *ab)
 void editor_draw_StatusBar(struct abuf *ab){
 ab_append(ab,"\x1b[7m]",4);
 char status[80],rstatus[80];
-int len=snprintf(status,sizeof(status),"%.20s - %d lines",E.filename ? E.filename :"[No Name]",E.numrows);
+int len=snprintf(status,sizeof(status),"%.20s - %d lines %s",E.filename ? E.filename :"[No Name]",E.numrows,E.dirty ?"(modified)":"");
 int rlen=snprintf(rstatus,sizeof(rstatus),"%d/%d",E.cy+1,E.numrows);
 if(len>E.screencols) len = E.screencols;
 ab_append(ab,status,len);
@@ -607,13 +724,26 @@ void editor_move_cursor(int key)
 
 void editor_process_keypress()
 {
+    static int quit_times=DELULU_QUIT_TIMES;
     int c = key_read_editor(); // Read a single character from standard input
     switch (c)                 // Process the character
     {
+    case '\r':
+        /*TODO*/
+        break;
     case CTRL_KEY('q'):                     // If Ctrl+Q is pressed
+        if(E.dirty && quit_times>0){
+            editor_setstatus_Message("WARNING!!! File has unsaved changes."
+            "Press Ctrl+q %d more times to quit.",quit_times);
+            quit_times--;
+            return;
+        }
         write(STDOUT_FILENO, "\x1b[2J", 4); // Clear the screen
         write(STDOUT_FILENO, "\x1b[H", 3);  // Move cursor to the home position (top-left corner)
         exit(0);                            // Exit the program
+        break;
+    case CTRL_KEY('s'):
+        editor_save();
         break;
     case HOME_KEY: // If Home key is pressed
         E.cx = 0;  // Move cursor to the beginning of the line
@@ -622,6 +752,14 @@ void editor_process_keypress()
         if(E.cy<E.numrows){
             E.cx = E.row[E.cy].size; // Move cursor to the end
         }
+        break;
+    case BACKSPACE:
+    case CTRL_KEY('h');
+    case DEL_KEY:
+        if(c==DEL_KEY){
+            editor_move_cursor(ARROW_RIGHT);
+        }
+        editor_delchar();
         break;
     case PAGE_UP:
     case PAGE_DOWN:
@@ -646,7 +784,14 @@ void editor_process_keypress()
     case ARROW_RIGHT:
         editor_move_cursor(c); // Move the cursor based on the key pressed
         break;
+    case CTRL_KEY('l'):
+    case '\x1b':
+        break;
+    default:
+        editor_insertchar(c);
+        break;
     }
+    quit_times=DELULU_QUIT_TIMES;
 }
 
 // init
@@ -660,6 +805,7 @@ void editor_init()
     E.coloff = 0;  // Initialize column offset for scrolling
     E.numrows = 0; // Initialize num of rows
     E.row=NULL;  //Initialise rows to NULL
+    E.dirty=0;
     E.filename=NULL;
     E.statusmsg[0]='\0';
     E.statusmsg_time=0;
@@ -689,7 +835,7 @@ int main(int argc, char *argv[])
     //         printf("%d ('%c')\r\n",c, c); // Print regular character
     //     }
     // }
-    editor_setstatus_Message("HELP: Ctrl-Q=quit");
+    editor_setstatus_Message("HELP: Ctrl+S=save | Ctrl+Q=quit");
     while (1)
     {
         // char c='\0';
@@ -727,4 +873,4 @@ int main(int argc, char *argv[])
  The separation allows for better organization of code,making it easier to maintain and extend functionality in the future.
  */
 
- //last step done is 100
+ //last step done is 121
