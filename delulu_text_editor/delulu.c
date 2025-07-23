@@ -24,7 +24,7 @@
 enum editor_key
 {
     // This enum defines the keys used in the editor
-    BACKSPACE=127;     //
+    BACKSPACE=127,     //
     ARROW_LEFT = 1000, // Left arrow key
     ARROW_RIGHT,       // Right arrow key
     ARROW_UP,          // Up arrow key
@@ -67,6 +67,8 @@ struct editor_config
 
 /*prototypes*/
 void editor_setstatus_Message(const char *fmt,...);
+void editor_refressh_screen();
+char *editorPrompt(char *prompt);
 
 // terminal functions
 void die(const char *s)
@@ -321,9 +323,13 @@ void editor_UpdateRows(erow *row){
     row->rsize=idx;
 }
 
-void editor_AppendRows(char *s,size_t len){
+void editor_AppendRows(int at,char *s,size_t len){
+    if(at<0||at>E.numrows){
+        return;
+    }
     E.row=realloc(E.row,sizeof(erow)*(E.numrows+1)); // Reallocate memory for the rows array
-    int at = E.numrows; // Get the current number of rows
+    memmove(&E.row[at++],&E.row[at],sizeof(erow)*(E.numrows-at));
+    //int at = E.numrows; // Get the current number of rows
     E.row[at].size = len; // Set the size of the new row
     E.row[at].chars = malloc(len + 1); // Allocate memory for the
     // characters in the new row
@@ -368,10 +374,25 @@ void editor_rowdelchar(erow *row,int at){
 /*editor operations*/
 void editor_insertchar(int c){
     if(E.cy==E.numrows){
-        editor_AppendRows("",0);
+        editor_AppendRows(E.numrows,"",0);
     }
     editor_RowinsertChar(&E.row[E.cy],E.cx,c);
     E.cx++;
+}
+
+void editor_insertNEwline(){
+    if(E.cx==0){
+        editor_AppendRows(E.cy,"",0);
+    }else{
+        erow *row=&E.row[E.cy];
+        editor_AppendRows(E.cy+1,&row->chars[E.cx],row->size-E.cx);
+        row=&E.row[E.cy];
+        row->size=E.cx;
+        row->chars[row->size]='\0';
+        editor_UpdateRows(row);
+    }
+    E.cy++;
+    E.cx=0;
 }
 
 void editor_delchar(){
@@ -388,7 +409,7 @@ void editor_delchar(){
     }else{
         E.cx=E.row[E.cy-1].size;
         editorRowAppendString(&E.row[E.cy-1],row->chars,row->size);
-        editor_rowdelchar(E.cy);
+        editor_rowdelchar(row,E.cy);
         E.cy--;
     }
 }
@@ -448,7 +469,7 @@ void editor_open(char *filename)
         while(linelen>0 && (line[linelen-1]=='\n' || line[linelen-1]=='\r')){
             linelen--; // Remove trailing newline or carriage return
         }
-        editor_AppendRows(line,linelen); // Append the line to the editor rows
+        editor_AppendRows(E.numrows,line,linelen); // Append the line to the editor rows
     }
     free(line);
     fclose(fp);
@@ -457,7 +478,11 @@ void editor_open(char *filename)
 
 void editor_save(){
     if(E.filename==NULL){
-        return;
+        E.filename=editorPrompt("Save as: %s (ESC to cancel)");
+        if(E.filename==NULL){
+            editor_setstatus_Message("Save aborted");
+            return;
+        }
     }
     int len;
     char *buf=editor_rowtostring(&len);
@@ -467,7 +492,7 @@ void editor_save(){
             if(write(fd,buf,len)==len){
                 close(fd);
                 free(buf);
-                E.ddirty=0;
+                E.dirty=0;
                 editor_setstatus_Message("%d bytes written to disk",len);
                 return;
             }
@@ -674,6 +699,40 @@ void editor_setstatus_Message(const char*fmt,...){
     E.statusmsg_time=time(NULL);
 }
 // input functions
+char *editorPrompt(char *prompt){
+    size_t bufsize=128;
+    char *buf=malloc(bufsize);
+    size_t buflen=0;
+    buf[0]='\0';
+    while(1){
+        editor_setstatus_Message(prompt,buf);
+        editor_refressh_screen();
+        int c =key_read_editor();
+        if(c==DEL_KEY||c==CTRL_KEY('h')||c==BACKSPACE){
+            if(buflen!=0){
+                buf[--buflen]='\0';
+            }
+        }
+        else if(c=='\x1b'){
+            editor_setstatus_Message("");
+            free(buf);
+            return NULL;
+        }else if(c=='\r'){
+            if(buflen!=0){
+                editor_setstatus_Message("");
+                return buf;
+            }
+        }else if(!iscntrl(c)&&c<128){
+            if(buflen==bufsize-1){
+                bufsize*=2;
+                buf=realloc(buf,bufsize);
+            }
+            buf[buflen++]=c;
+            buf[buflen]='\0';
+        }
+    }
+}
+
 void editor_move_cursor(int key)
 {
     erow *row =(E.cy>=E.numrows) ? NULL :&E.row[E.cy];
@@ -730,6 +789,7 @@ void editor_process_keypress()
     {
     case '\r':
         /*TODO*/
+        editor_insertNEwline();
         break;
     case CTRL_KEY('q'):                     // If Ctrl+Q is pressed
         if(E.dirty && quit_times>0){
@@ -754,7 +814,7 @@ void editor_process_keypress()
         }
         break;
     case BACKSPACE:
-    case CTRL_KEY('h');
+    case CTRL_KEY('h'):
     case DEL_KEY:
         if(c==DEL_KEY){
             editor_move_cursor(ARROW_RIGHT);
@@ -873,4 +933,4 @@ int main(int argc, char *argv[])
  The separation allows for better organization of code,making it easier to maintain and extend functionality in the future.
  */
 
- //last step done is 121
+ //last step done is 130
